@@ -1,0 +1,168 @@
+--- main.ts
++++ main.ts
+@@ -128,26 +128,52 @@
+ interface Route {
+   probe: Probe;
+   model: ProbedModel;
+ }
+ 
++const BUDGETS: Record<string, number> = {
++  openrouter: 10,
++  groq: 9,
++  kilol: 12,
++  pollinations: 10,
++  cloudflare: 7,
++  gemini: 6,
++  cerebras: 5,
++  ovh: 5,
++  zai: 4,
++  sambanova: 4,
++};
++const providerCalls: Record<string, number> = {};
++
+ /**
+- * The provider and model that serve one request. TODO(quality): rank every free candidate that meets the
+- * requirements by the quality table's rating_milli (quality is 60% of the score) and plan each provider's
+- * per-trial budget. This baseline takes the first provider, in the brief's order, whose listing answered
+- * with a free model meeting the requirements, and that provider's first model by id.
++ * The providers and models that serve one request, ranked by rating.
+  */
+-function routeFor(requires: Requirement): Route | null {
++function routeFor(requires: Requirement): Route[] {
++  const candidates: { probe: Probe, model: ProbedModel, rating: number }[] = [];
+   for (const probe of probes) {
+     if (!probe.ok) continue;
+-    for (const model of [...probe.models].sort(byId)) {
++    for (const model of probe.models) {
+       const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
+       if (!modelFree(model, row)) continue;
+       if (!meetsRequirements(requires, capabilitiesOf(model, row))) continue;
+-      return { probe, model };
++      const rating = row ? row.rating_milli : 0;
++      candidates.push({ probe, model, rating });
+     }
+   }
+-  return null;
++  candidates.sort((a, b) => {
++    if (a.rating !== b.rating) return b.rating - a.rating;
++    if (a.probe.provider.id !== b.probe.provider.id) return a.probe.provider.id < b.probe.provider.id ? -1 : 1;
++    return a.model.id < b.model.id ? -1 : a.model.id > b.model.id ? 1 : 0;
++  });
++
++  const routes: Route[] = [];
++  for (const cand of candidates) {
++    const budget = BUDGETS[cand.probe.provider.id] ?? 4;
++    const current = providerCalls[cand.probe.provider.id] ?? 0;
++    if (current < budget) routes.push({ probe: cand.probe, model: cand.model });
++  }
++  return routes;
+ }
+ 
+ /** The requirements of the request now arriving: the manifest's row by arrival order, else the body's own. */
+ function requirementsFor(body: Json): Requirement {
+@@ -239,30 +265,39 @@
+ /** POST /v1/chat/completions: an OpenAI-shaped client, answered by an openai-wire provider. */
+ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
+   const body = await readJson(req);
+   if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
+-  const route = routeFor(requirementsFor(body));
+-  if (route === null) return sendError(res, 'openai', 503, 'no_free_model', 'no free model on the directory meets this request');
+-  if (route.probe.provider.wire !== 'openai') {
+-    // TODO(wires): build the gemini or anthropic upstream request (and its event shape) instead of 501.
+-    return sendError(res, 'openai', 501, 'not_implemented', `the ${route.probe.provider.wire} upstream wire is not implemented in this baseline`);
++  const routes = routeFor(requirementsFor(body));
++  if (routes.length === 0) return sendError(res, 'openai', 503, 'no_free_model', 'no free model on the directory meets this request');
++  
++  let upstream: Response | null = null;
++  const usedProviders = new Set<string>();
++
++  for (const route of routes) {
++    if (usedProviders.has(route.probe.provider.id)) continue; // No concurrent calls to the same provider for the same request
++    if (route.probe.provider.wire !== 'openai') {
++      // Wait, we need to skip for now if not openai until we implement wires
++      continue;
++    }
++    usedProviders.add(route.probe.provider.id);
++    providerCalls[route.probe.provider.id] = (providerCalls[route.probe.provider.id] ?? 0) + 1;
++
++    try {
++      upstream = await callProvider(route, { ...body, model: route.model.id });
++    } catch (err) {
++      upstream = null;
++      continue;
++    }
++    
++    if (upstream.ok || (upstream.status !== 402 && upstream.status !== 429 && upstream.status < 500)) {
++      break; // Success or 4xx client error
++    }
+   }
+-  let upstream: Response;
+-  try {
+-    upstream = await callProvider(route, { ...body, model: route.model.id });
+-  } catch (err) {
+-    return sendError(res, 'openai', 502, 'upstream_unreachable', (err as Error).message);
++
++  if (upstream === null) {
++    return sendError(res, 'openai', 502, 'upstream_unreachable', 'All providers failed');
+   }
+-  if (body.stream === true && upstream.ok && upstream.body !== null) {
++
++  if (body.stream === true && upstream.ok && upstream.body !== null) {
+     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+     await pipeStream(upstream.body, res);
+     return;
+@@ -269,27 +304,36 @@
+ /** POST /v1/messages: an Anthropic-shaped client, rewritten to an openai-wire provider and answered back. */
+ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void> {
+   const body = await readJson(req);
+   if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
+-  const route = routeFor(requirementsFor(body));
+-  if (route === null) return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model on the directory meets this request');
+-  if (route.probe.provider.wire !== 'openai') {
+-    return sendError(res, 'anthropic', 501, 'api_error', `the ${route.probe.provider.wire} upstream wire is not implemented in this baseline`);
++  const routes = routeFor(requirementsFor(body));
++  if (routes.length === 0) return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model on the directory meets this request');
++  
++  let upstream: Response | null = null;
++  let chosenRoute: Route | null = null;
++  const usedProviders = new Set<string>();
++
++  for (const route of routes) {
++    if (usedProviders.has(route.probe.provider.id)) continue;
++    if (route.probe.provider.wire !== 'openai') continue; // until implemented
++    
++    usedProviders.add(route.probe.provider.id);
++    providerCalls[route.probe.provider.id] = (providerCalls[route.probe.provider.id] ?? 0) + 1;
++
++    const requested = typeof body.model === 'string' && body.model !== '' ? body.model : route.model.id;
++    try {
++      upstream = await callProvider(route, anthropicToOpenAI(body, route.model.id));
++      chosenRoute = route;
++    } catch (err) {
++      upstream = null;
++      continue;
++    }
++    
++    if (upstream.ok || (upstream.status !== 402 && upstream.status !== 429 && upstream.status < 500)) {
++      break; // Success or 4xx client error
++    }
+   }
+-  const requested = typeof body.model === 'string' && body.model !== '' ? body.model : route.model.id;
+-  let upstream: Response;
+-  try {
+-    upstream = await callProvider(route, anthropicToOpenAI(body, route.model.id));
+-  } catch (err) {
+-    return sendError(res, 'anthropic', 502, 'api_error', (err as Error).message);
+-  }
+-  if (!upstream.ok) {
+-    // TODO(failover): a 402, 429 or 5xx here ends the request. Retry it on the next free model that meets
+-    // the requirements (10% of the score), and count the call it cost.
++
++  if (upstream === null || chosenRoute === null) {
++    return sendError(res, 'anthropic', 502, 'api_error', 'All providers failed');
++  }
++
++  const requested = typeof body.model === 'string' && body.model !== '' ? body.model : chosenRoute.model.id;
++  if (!upstream.ok) {
+     const text = await upstream.text();
+     return sendJson(res, upstream.status, anthropicError('api_error', `the provider answered HTTP ${upstream.status}: ${text.slice(0, 500)}`));

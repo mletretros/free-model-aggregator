@@ -1,0 +1,44 @@
+You are improving a competition entry for free-model-aggregator-01. The repo is /root/projects/bounty/makefun/fmagg (git repo, current HEAD = starter kit baseline).
+
+## What it is
+The repo is a Node 22 TypeScript program (`main.ts` + `lib/`, run as `node /bot/main.ts`, TypeScript type-stripping, RELATIVE IMPORTS NEED THE .ts EXTENSION, no npm dependencies, standard library only). It is an OpenAI+Anthropic compatible API server over 10 simulated free-tier providers.
+
+Read these first, in this order:
+1. `main.ts` — the starter. It has TODO markers naming every weakness.
+2. `lib/providers.ts` and `lib/wire.ts` — the brief parser/probe and the wire translators.
+3. `BRIEF.txt` — the exact brief a trial hands the server (provider directory, quality table with ratings, workload manifest of 20 requests).
+4. `/root/projects/bounty/makefun/kit50/free-model-aggregator-01-kit/RULES.txt` — the rules, especially "Scoring", "The providers", "The trial", and the determinism paragraph.
+
+## Baseline score (measured)
+grade-local on practice/trial-0 gives: `{"catalog":100,"failover":0,"quality":38,"score":38,"served":40,"upstream_calls":14,"wire":39}`.
+Only 8 of 20 requests are valid. Vision requests (r01,r02,r06) and min_context requests (r10,r11,r12) return 501 because only the openai upstream wire is implemented. Failover is 0 because a 402/429/5xx ends the request.
+
+## Goal
+Raise the local dev score as high as you can. Target: score >= 92 with served = 100 (20/20 valid), failover >= 80, wire >= 95, quality >= 95, catalog = 100. Do NOT regress catalog.
+
+## How to measure (run this yourself, repeat after every change)
+```
+cd /root/projects/bounty/makefun/kit50/free-model-aggregator-01-kit && env -u HERMES_SESSION_ID -u HERMES_SESSION_KEY HERMES_HOME=/root/mfhermes HOME=/root/mfhome node cli/makefun.mjs grade-local --kit . --bot /root/projects/bounty/makefun/fmagg --driver process 2>&1 | tail -20
+```
+It takes ~40 s and needs no API key (this competition has model_calls: optional; the trial only talks to the simulated providers). It prints the score columns and also the path of the kept run.
+
+## Per-request diagnostic (this is the fastest way to see what fails)
+After a grade-local run, the kept trial directory (printed as `kept .../trial-0`) holds `state/state.json`. Each of the 20 requests carries `valid`, `status`, `provider`, `model`, `upstream_calls`, `failures[]` and `checks[]` with `{name, pass, detail}`. Check names seen so far: http, shape, content, echo_user, echo_tools, echo_max_tokens, echo_image, echo_stop, echo_system, echo_json, stop_reason, usage, free_model, one_provider, requirements, stream_order. Read the first failing check's `detail` string — it says exactly what the client wanted. Example:
+```
+python3 -c "import json;s=json.load(open('<kept>/trial-0/state/state.json'));[print(r['id'],r['valid'],r['status'],r['provider'],r['model'],[ (c['name'],c['detail']) for c in r['checks'] if not c['pass']][:2]) for r in s['requests']]"
+```
+
+## What to change (in priority order)
+1. **Routing by quality (60% of the score).** Rank every free model that meets the request's requirements by `rating_milli` from the brief's quality table and pick the best one that still has budget left. Best legal picks, from the table: `openrouter` `z-ai/glm-5.3-flash:free` rating 1475 (tools, json, 204800 ctx, no vision); `zai`/`cloudflare` `glm-4.7-flash` 1470 (tools, json, 204800); `sambanova` `deepseek-v3.2` 1465; `gemini` `gemini-3.8-flash` 1458 (tools, vision, json, 1048576 ctx) — the only model that satisfies tools+vision, so r01/r02/r06 must go there; `ovh` `qwen3.5-397b` 1440. Plan budgets: the sealed per-provider budget ranges are in the kit's `program/scorer/score.mjs` (search `calls_min`) — openrouter 10-12, groq 9-12, kilol 12-16, pollinations 10-14, cloudflare 7-8, gemini 6-8, cerebras 5-6, ovh 5-6, zai 4-5, sambanova 4-5 calls per trial. Never exceed a provider's low end; spread across providers; keep a reserve for failover.
+2. **Failover (10%).** On 402/429/5xx (or a network error) from a provider, pick the next best legal model on a DIFFERENT provider that still has budget, and retry. One provider serves one call at a time — no concurrent calls to the same provider. Count every call. A request whose first call refused must still be served to earn failover credit.
+3. **Wires (10%) + served (15%).** Implement all three upstream wires: openai (`POST <base>/v1/chat/completions`), anthropic (`POST <base>/v1/messages`, send the `anthropic-version` header the client sent), gemini (`POST <base>/v1beta/models/<model>:generateContent` or `:streamGenerateContent`). Translate the client's request faithfully in both directions — the provider echoes what it parsed and the client compares that echo with what it sent, so a rewritten or dropped field loses the check (echo_user, echo_tools, echo_max_tokens, echo_image, echo_stop, echo_system, echo_json). Map stop reasons end_turn→stop, max_tokens→length, tool_use→tool_calls, refusal→content_filter. Return the provider's text whole, its usage as that wire reports it, tool calls and their results. On the client's wire, produce the exact streaming event order it expects.
+4. **Keep catalog = 100.** The `--list` document must stay byte-identical to the register body.
+
+## Hard constraints
+- Determinism: the trial is replayed and the state export must match byte for byte. Derive every choice only from the brief, the requests and the providers' answers. No `Date.now()`, no `Math.random()` without `MAKEFUN_TRIAL_SEED`, no timeouts that change behaviour.
+- No network beyond `$MAKEFUN_ENV_URL`. No npm install, no new dependencies, stdlib only.
+- The server must exit 0 when `GET $MAKEFUN_ENV_URL/work` says `{"done": true}`.
+- Keep every file inside the repo. Keep `LICENSE`.
+
+## Working style
+Work iteratively: change code, run grade-local, read the failing checks' details, fix, repeat. Commit with git after each improvement (git config already set). Do not stop while the score is still climbing; stop when you have hit the target or three consecutive runs show no gain — then report the final columns and what is still failing.
