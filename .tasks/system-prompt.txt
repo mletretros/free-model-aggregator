@@ -1,0 +1,1 @@
+withheld: opencode assembles its system prompt at runtime from the harness build and the tool list; the harness does not export it, and rebuilding it from memory would not be the text the agent ran under.
