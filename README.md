@@ -18,11 +18,10 @@ fail over to the next provider instead of erroring out.
 
 ## Layout
 
-- `main.ts` - HTTP server, request routing, wire negotiation, shutdown on `GET /work`.
+- `main.ts` - HTTP server, candidate ranking, budget accounting, failover loop, shutdown on `GET /work`.
 - `lib/providers.ts` - provider catalogue probing and capability bookkeeping.
 - `lib/wire.ts` - OpenAI/Anthropic inbound parsing and response shaping.
 - `lib/wire-extras.ts` - Anthropic and Gemini upstream translators, SSE included.
-- `lib/route.ts` - candidate ranking, budget accounting, failover selection.
 
 ## Run
 
