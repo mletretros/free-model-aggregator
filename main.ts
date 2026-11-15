@@ -79,6 +79,15 @@ import {
   openAIToAnthropic,
   type ServedModel,
 } from './lib/wire.ts';
+import {
+  ensureOpenAIUsage,
+  openAIToAnthropicRequest,
+  anthropicToOpenAIResponse,
+  openAIEventsFromAnthropic,
+  openAIToGeminiRequest,
+  geminiToOpenAIResponse,
+  openAIEventsFromGemini
+} from './lib/wire-extras.ts';
 
 /** The wire protocol's version, in the register body. */
 const PROTOCOL_VERSION = 1;
@@ -237,15 +246,30 @@ function models(req: IncomingMessage, res: ServerResponse): void {
   else sendJson(res, 200, openAIModelList(list));
 }
 
-/** POST one request to the routed provider's Chat Completions route. */
+/** POST one request to the routed provider's completion route. */
 async function callProvider(route: Route, body: Json): Promise<Response> {
   const base = joinBase(ENV_URL, route.probe.provider.base);
   const headers: Record<string, string> = {
     'content-type': 'application/json',
     ...authHeaders(route.probe.provider.auth, route.probe.provider.key),
   };
-  if (body.stream === true) headers.accept = 'text/event-stream';
-  return fetch(`${base}/v1/chat/completions`, { method: 'POST', headers, body: JSON.stringify(body) });
+  
+  const wire = route.probe.provider.wire;
+  
+  if (wire === 'anthropic') {
+    headers['anthropic-version'] = '2023-06-01';
+    const anthropicBody = openAIToAnthropicRequest(body, route.model.id);
+    return fetch(`${base}/v1/messages`, { method: 'POST', headers, body: JSON.stringify(anthropicBody) });
+  } else if (wire === 'gemini') {
+    const geminiBody = openAIToGeminiRequest(body, route.model.id);
+    const endpoint = body.stream ? 'streamGenerateContent?alt=sse' : 'generateContent';
+    return fetch(`${base}/v1beta/models/${route.model.id}:${endpoint}`, { method: 'POST', headers, body: JSON.stringify(geminiBody) });
+  } else {
+    // OpenAI wire
+    if (body.stream === true) headers.accept = 'text/event-stream';
+    const openaiBody = ensureOpenAIUsage(body);
+    return fetch(`${base}/v1/chat/completions`, { method: 'POST', headers, body: JSON.stringify(openaiBody) });
+  }
 }
 
 /** Copy a provider's event stream to the client as it arrives. */
@@ -271,17 +295,18 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   if (routes.length === 0) return sendError(res, 'openai', 503, 'no_free_model', 'no free model on the directory meets this request');
   
   let upstream: Response | null = null;
+  let chosenRoute: Route | null = null;
   const usedProviders = new Set<string>();
 
   for (const route of routes) {
     if (usedProviders.has(route.probe.provider.id)) continue;
-    if (route.probe.provider.wire !== 'openai') continue;
 
     usedProviders.add(route.probe.provider.id);
     providerCalls[route.probe.provider.id] = (providerCalls[route.probe.provider.id] ?? 0) + 1;
 
     try {
       upstream = await callProvider(route, { ...body, model: route.model.id });
+      chosenRoute = route;
     } catch (err) {
       upstream = null;
       continue;
@@ -292,18 +317,38 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
     }
   }
 
-  if (upstream === null) {
+  if (upstream === null || chosenRoute === null) {
     return sendError(res, 'openai', 502, 'upstream_unreachable', 'All providers failed');
   }
 
-  if (body.stream === true && upstream.ok && upstream.body !== null) {
-    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
-    await pipeStream(upstream.body, res);
+  if (!upstream.ok) {
+    const text = await upstream.text();
+    res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') ?? 'application/json' });
+    res.end(text);
     return;
   }
-  const text = await upstream.text();
-  res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') ?? 'application/json' });
-  res.end(text);
+
+  if (body.stream === true && upstream.body !== null) {
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+    if (chosenRoute.probe.provider.wire === 'anthropic') {
+      for await (const event of openAIEventsFromAnthropic(upstream.body, chosenRoute.model.id)) res.write(event);
+    } else if (chosenRoute.probe.provider.wire === 'gemini') {
+      for await (const event of openAIEventsFromGemini(upstream.body, chosenRoute.model.id)) res.write(event);
+    } else {
+      await pipeStream(upstream.body, res);
+    }
+    res.end();
+    return;
+  }
+  
+  const answer: unknown = await upstream.json();
+  let finalAnswer = answer;
+  if (chosenRoute.probe.provider.wire === 'anthropic') {
+    finalAnswer = anthropicToOpenAIResponse(isRecord(answer) ? answer : {}, chosenRoute.model.id);
+  } else if (chosenRoute.probe.provider.wire === 'gemini') {
+    finalAnswer = geminiToOpenAIResponse(isRecord(answer) ? answer : {}, chosenRoute.model.id);
+  }
+  sendJson(res, 200, finalAnswer);
 }
 
 /** POST /v1/messages: an Anthropic-shaped client, rewritten to an openai-wire provider and answered back. */
@@ -319,7 +364,6 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
 
   for (const route of routes) {
     if (usedProviders.has(route.probe.provider.id)) continue;
-    if (route.probe.provider.wire !== 'openai') continue;
 
     usedProviders.add(route.probe.provider.id);
     providerCalls[route.probe.provider.id] = (providerCalls[route.probe.provider.id] ?? 0) + 1;
@@ -346,14 +390,65 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
     const text = await upstream.text();
     return sendJson(res, upstream.status, anthropicError('api_error', `the provider answered HTTP ${upstream.status}: ${text.slice(0, 500)}`));
   }
+  
   if (body.stream === true && upstream.body !== null) {
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
-    for await (const event of anthropicEventsFromOpenAI(upstream.body, requested)) res.write(event);
+    
+    // We need an OpenAI stream to feed into anthropicEventsFromOpenAI
+    // Wait, if upstream is Anthropic, its body is an Anthropic stream!
+    // So we would need anthropicEventsFromAnthropic? No, wait!
+    // We can translate upstream Anthropic stream to OpenAI stream, then to Anthropic stream.
+    // That's crazy! Let's do that for now.
+    let openaiStream: AsyncIterable<string>;
+    if (chosenRoute.probe.provider.wire === 'anthropic') {
+      openaiStream = openAIEventsFromAnthropic(upstream.body, requested);
+    } else if (chosenRoute.probe.provider.wire === 'gemini') {
+      openaiStream = openAIEventsFromGemini(upstream.body, requested);
+    } else {
+      // It's already OpenAI stream but as strings
+      openaiStream = (async function*() {
+        const reader = upstream.body!.getReader();
+        const decoder = new TextDecoder();
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            yield decoder.decode(value, { stream: true });
+          }
+          yield decoder.decode();
+        } finally {
+          reader.releaseLock();
+        }
+      })();
+    }
+
+    // Now feed openaiStream into something that parses it as a ReadableStream?
+    // Wait, anthropicEventsFromOpenAI expects a ReadableStream<Uint8Array>.
+    // Let's create a ReadableStream from openaiStream.
+    const readable = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        const encoder = new TextEncoder();
+        for await (const chunk of openaiStream) {
+          controller.enqueue(encoder.encode(chunk));
+        }
+        controller.close();
+      }
+    });
+
+    for await (const event of anthropicEventsFromOpenAI(readable, requested)) res.write(event);
     res.end();
     return;
   }
+  
   const answer: unknown = await upstream.json();
-  sendJson(res, 200, openAIToAnthropic(isRecord(answer) ? answer : {}, requested));
+  let openaiAnswer = answer;
+  if (chosenRoute.probe.provider.wire === 'anthropic') {
+    openaiAnswer = anthropicToOpenAIResponse(isRecord(answer) ? answer : {}, requested);
+  } else if (chosenRoute.probe.provider.wire === 'gemini') {
+    openaiAnswer = geminiToOpenAIResponse(isRecord(answer) ? answer : {}, requested);
+  }
+  
+  sendJson(res, 200, openAIToAnthropic(isRecord(openaiAnswer) ? openaiAnswer : {}, requested));
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
