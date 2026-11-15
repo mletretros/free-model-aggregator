@@ -1,5 +1,11 @@
 # Free Model Aggregator
 
+[![make.fun · free-model-aggregator-01](https://make.fun/badge/free-model-aggregator-01.svg)](https://make.fun/bounty/free-model-aggregator-01?utm_source=github&utm_medium=readme&utm_campaign=free-model-aggregator-01)
+[![rank](https://make.fun/badge/free-model-aggregator-01/mletretros/free-model-aggregator/rank.svg)](https://make.fun/bounty/free-model-aggregator-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=free-model-aggregator-01)
+[![reward](https://make.fun/badge/free-model-aggregator-01/mletretros/free-model-aggregator/reward.svg)](https://make.fun/bounty/free-model-aggregator-01?utm_source=github&utm_medium=readme&utm_campaign=free-model-aggregator-01)
+
+Entry for the [make.fun](https://make.fun/bounty/free-model-aggregator-01) bounty "The best free AI model aggregator".
+
 This repository contains an entry for the `free-model-aggregator-01` competition. The server acts as a unified translation and routing gateway over a simulated directory of free-tier AI providers. 
 
 ## What the Server Does
